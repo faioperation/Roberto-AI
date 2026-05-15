@@ -1,14 +1,28 @@
+import os
+import json
 import asyncio
+import requests
+from datetime import datetime
+from typing import Optional
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+
 from schemas.payloads import CallRequest, AssistantRequest, TelephonyRequest
 from vapi.vapi_handler import (
     create_assistant,
     trigger_call,
     link_telephony,
     process_webhook,
-    get_call_status
+    get_call_status,
 )
+
+load_dotenv()
+
+VAPI_ASSISTANT_ID = os.getenv("VAPI_ASSISTANT_ID", "")
+LEADS_FILE = "leads_backup.json"
 
 app = FastAPI(title="Tugatai AI - Voice Agent API")
 
@@ -22,6 +36,57 @@ app.add_middleware(
 
 
 # ================================
+# Schema for the frontend form
+# ================================
+class CallTriggerRequest(BaseModel):
+    phone_number: str = Field(
+        ...,
+        description="Full phone number in E.164 format, e.g. +93701234567",
+        examples=["+93701234567"],
+    )
+    email: Optional[str] = Field(
+        None,
+        description="Optional customer email captured with the lead",
+    )
+
+
+# ================================
+# Helpers
+# ================================
+def _save_quick_lead(phone: str, email: Optional[str], call_id: str) -> None:
+    """
+    Append a lightweight lead entry to leads_backup.json (JSONL format)
+    the moment a call is requested. This guarantees we keep the contact
+    info even if the user never picks up the phone.
+    The full lead from the call itself comes in later via /webhook/vapi.
+    """
+    entry = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "source": "request_call_form",
+        "customer_phone": phone,
+        "email": email,
+        "call_id": call_id,
+        "status": "call_triggered",
+    }
+    try:
+        with open(LEADS_FILE, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception as e:
+        print(f"[LEADS] Failed to write quick lead: {e}")
+
+
+def _validate_e164(phone: str) -> str:
+    """Strip whitespace/dashes and ensure E.164-ish format (+ followed by 7–15 digits)."""
+    cleaned = phone.strip().replace(" ", "").replace("-", "")
+    if not cleaned.startswith("+") or not cleaned[1:].isdigit() or not (8 <= len(cleaned) <= 16):
+        raise HTTPException(
+            status_code=400,
+            detail="Phone number must be in E.164 format, e.g. +93701234567",
+        )
+    return cleaned
+
+
+# ================================
 # ENDPOINTS
 # ================================
 
@@ -31,23 +96,66 @@ def root():
 
 
 # ================================
-# TRIGGER CALL
+# FRONTEND "Get a call" BUTTON
+# This is the one the landing page hits.
+# ================================
+@app.post("/voice/request-call")
+def request_call(req: CallTriggerRequest):
+    """
+    Triggered when the user clicks 'Get a call' on the landing page.
+    Saves their contact info, then asks Vapi to call them via Twilio.
+    """
+    if not VAPI_ASSISTANT_ID:
+        raise HTTPException(
+            status_code=500,
+            detail="VAPI_ASSISTANT_ID is not configured in .env",
+        )
+
+    phone = _validate_e164(req.phone_number)
+
+    try:
+        call = trigger_call(
+            customer_phone=phone,
+            assistant_id=VAPI_ASSISTANT_ID,
+        )
+    except requests.exceptions.HTTPError as e:
+        body = e.response.text if e.response is not None else str(e)
+        raise HTTPException(status_code=502, detail=f"Vapi error: {body}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to trigger call: {e}")
+
+    call_id = call.get("id", "")
+    _save_quick_lead(phone=phone, email=req.email, call_id=call_id)
+
+    return {
+        "success": True,
+        "status": "calling",
+        "call_id": call_id,
+        "phone": phone,
+        "email": req.email,
+        "message": "Luna will call you in a few seconds.",
+    }
+
+
+# ================================
+# TRIGGER CALL (backend-to-backend usage, e.g. admin panel)
 # ================================
 @app.post("/voice/call")
 def make_call(req: CallRequest):
     """
-    Frontend sends customer phone number.
-    Luna calls them back immediately.
+    Direct call trigger when the caller already knows the assistant_id
+    (e.g. another internal service, admin panel, scheduled callback).
+    The landing page should use /voice/request-call instead.
     """
     try:
         result = trigger_call(
             customer_phone=req.customer_phone,
-            assistant_id=req.assistant_id
+            assistant_id=req.assistant_id,
         )
         return {
             "success": True,
             "call_id": result.get("id"),
-            "message": "Luna is calling the customer now."
+            "message": "Luna is calling the customer now.",
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -65,12 +173,12 @@ def setup_assistant(req: AssistantRequest):
     try:
         result = create_assistant(
             tenant_id=req.tenant_id,
-            business_name=req.business_name
+            business_name=req.business_name,
         )
         return {
             "success": True,
             "assistant_id": result.get("id"),
-            "message": f"Luna created for {req.business_name}"
+            "message": f"Luna created for {req.business_name}",
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -90,7 +198,7 @@ def link_phone(req: TelephonyRequest):
         return {
             "success": True,
             "message": "Twilio number linked to Luna.",
-            "data": result
+            "data": result,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -109,7 +217,7 @@ async def vapi_webhook(request: Request):
         payload = await request.json()
         asyncio.create_task(handle_webhook_background(payload))
         return {"status": "ok"}
-    except Exception as e:
+    except Exception:
         return {"status": "ok"}  # Always return 200 fast to Vapi
 
 
@@ -132,6 +240,7 @@ async def handle_webhook_background(payload: dict):
 def call_status(call_id: str):
     """
     Check status of any call by call_id.
+    Useful for the frontend to show "ringing → in-progress → ended".
     """
     try:
         result = get_call_status(call_id)
@@ -151,15 +260,18 @@ def get_leads():
     """
     try:
         leads = []
-        with open("leads_backup.json", "r") as f:
+        with open(LEADS_FILE, "r") as f:
             for line in f:
                 line = line.strip()
                 if line:
-                    leads.append(line)
+                    try:
+                        leads.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        leads.append(line)  # fall back to raw line if not JSON
         return {
             "success": True,
             "total": len(leads),
-            "leads": leads
+            "leads": leads,
         }
     except FileNotFoundError:
         return {"success": True, "total": 0, "leads": []}
