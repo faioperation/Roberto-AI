@@ -1,0 +1,58 @@
+# Environment
+.env
+.env.local
+.env.production
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+wheels/
+pip-wheel-metadata/
+.installed.cfg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# Local Data
+leads_backup.json
+*.json.bak
+
+# AWS
+*.pem
+*.key
+
+# Cloudflare
+cloudflared.exe
+cloudflared
+
+# Compiled
+*.pyc
+*.pyo
+
+# OS
+.DS_Store
+Thumbs.db
